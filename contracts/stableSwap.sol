@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8;
 
 library Math {
@@ -7,37 +8,25 @@ library Math {
 }
 
 contract StableSwap {
+    address [2] public tokenList;
+    uint [2] public reserves;
+    uint public shareSupply;
     uint private constant N = 2;
     uint private constant A = 85 * (N ** (N - 1));
 
-    address[N] public tokens;
-    uint[N] public balances;
-
-    uint private constant DECIMALS = 18;
-    uint public totalSupply;
-    mapping(address => uint) public balanceOf;
-
-    constructor(address _token1, address _token2) {
-        tokens = [_token1, _token2];
+    constructor(address _token1, address _token2, uint[N] memory initReserves) {
+        tokenList = [_token1, _token2];
+        reserves[0] = initReserves[0];
+        reserves[1] = initReserves[1];
     }
 
-    function _mint(address _to, uint _amount) private {
-        balanceOf[_to] += _amount;
-        totalSupply += _amount;
-    }
-
-    function _burn(address _from, uint _amount) private {
-        balanceOf[_from] -= _amount;
-        totalSupply -= _amount;
-    }
-
-    function _getD(uint[N] memory _balances) private pure returns (uint) {
+    function _getD(uint[N] memory _reserves) private pure returns (uint) {
         uint a = A * N; // An^n
         uint s; // x_0 + x_1 + ... + x_(n-1)
         uint p = 1; // x_0 * x_1 * .... * x_(n-1)
         for (uint i; i < N; ++i) {
-            s += _balances[i];
-            p *= _balances[i];
+            s += _reserves[i];
+            p *= _reserves[i];
         }
         uint d = s;
         uint d_prev;
@@ -62,33 +51,28 @@ contract StableSwap {
         revert("D didn't converge");
     }
 
-    function _getY(uint i, uint j, uint x, uint[N] memory _balances) private pure returns (uint) {
+    function _getY(uint i, uint j, uint x, uint[N] memory _reserves) private pure returns (uint) {
         uint a = A * N;
-        uint d = _getD(_balances);
-        uint s;
+        uint d = _getD(_reserves);
+        uint sk;
         uint c = d;
         uint _x;
         for (uint k; k < N; ++k) {
-            if (k == i) {
-                _x = x;
-            } else if (k == j) {
-                continue;
-            } else {
-                _x = _balances[k];
-            }
+            if (k == i)  _x = x;
+            if (k == j) continue;
+            else _x = _reserves[k];
 
-            s += _x;
+            sk += _x;
             c = (c * d) / (N * _x);
         }
         c = (c * d) / (N * a);
-        uint b = s + d / a;
-
-        uint y_prev;
+        uint b = sk + d / a;
+        uint prev_y;
         uint y = d;
         for (uint _i; _i < 255; ++_i) {
-            y_prev = y;
+            prev_y = y;
             y = (y * y + c) / (2 * y + b - d);
-            if (Math.abs(y, y_prev) <= 1) {
+            if (Math.abs(y, prev_y) <= 1) {
                 return y;
             }
         }
@@ -96,102 +80,38 @@ contract StableSwap {
     }
 
     function getCurrentD () public view returns (uint d) {
-        d = _getD(balances);
+        d = _getD(reserves);
     }
 
     function getAmountOut (uint i, uint j, uint dx) public view returns (uint amountOut) {
-        uint[N] memory _balances = balances;
-        uint x = _balances[i] + dx;
-        uint y0 = _balances[j];
-        uint y1 = _getY(i, j, x, _balances);
+        uint[N] memory _reserves = reserves;
+        uint x = _reserves[i] + dx;
+        uint y0 = _reserves[j];
+        uint y1 = _getY(i, j, x, _reserves);
         amountOut = (y0 - y1 - 1);
     }
 
-    function getVirtualPrice() external view returns (uint) {
-        uint d = _getD(balances);
-        uint _totalSupply = totalSupply;
-        if (_totalSupply > 0) {
-            return (d * 10 ** DECIMALS) / _totalSupply;
-        }
-        return 0;
-    }
 
     function swap(uint i, uint j, uint dx, uint minDy) external returns (uint dy, uint y, uint d, uint) {
         require(i != j, "i = j");
 
-        IERC20(tokens[i]).transferFrom(msg.sender, address(this), dx);
+        IERC20(tokenList[i]).transferFrom(msg.sender, address(this), dx);
+        uint[N] memory _reserves = reserves;
+        uint x = _reserves[i] + dx;
 
-        // Calculate dy
-        uint[N] memory _balances = balances;
-        uint x = _balances[i] + dx;
-
-        uint y0 = _balances[j];
-        d = _getD(_balances);
-        uint y1 = _getY(i, j, x, _balances);
-        // y0 must be >= y1, since x has increased
-        // -1 to round down
+        uint y0 = _reserves[j];
+        d = _getD(_reserves);
+        uint y1 = _getY(i, j, x, _reserves);
         dy = (y0 - y1 - 1);
 
         // Subtract fee from dy
         require(dy >= minDy, "dy < min");
 
-        balances[i] += dx;
-        balances[j] -= dy;
+        reserves[i] += dx;
+        reserves[j] -= dy;
 
-        IERC20(tokens[j]).transfer(msg.sender, dy);
+        IERC20(tokenList[j]).transfer(msg.sender, dy);
         return (dy, y1, d, A);
-    }
-
-    function addLiquidity(
-        uint[N] calldata amounts,
-        uint minShares
-    ) external returns (uint shares) {
-        uint _totalSupply = totalSupply;
-        uint d0;
-        uint[N] memory old_xs = balances;
-        if (_totalSupply > 0) {
-            d0 = _getD(old_xs);
-        }
-        uint[N] memory new_xs;
-        for (uint i; i < N; ++i) {
-            uint amount = amounts[i];
-            if (amount > 0) {
-                IERC20(tokens[i]).transferFrom(msg.sender, address(this), amount);
-                new_xs[i] = old_xs[i] + amount;
-            } else {
-                new_xs[i] = old_xs[i];
-            }
-        }
-        uint d1 = _getD(new_xs);
-        require(d1 > d0, "liquidity didn't increase");
-        for (uint i; i < N; ++i) {
-            balances[i] += amounts[i];
-        }
-        if (_totalSupply > 0) {
-            shares = ((d1 - d0) * _totalSupply) / d0;
-        } else {
-            shares = d1;
-        }
-        require(shares >= minShares, "shares < min");
-        _mint(msg.sender, shares);
-    }
-
-    function removeLiquidity(
-        uint shares,
-        uint[N] calldata minAmountsOut
-    ) external returns (uint[N] memory amountsOut) {
-        uint _totalSupply = totalSupply;
-        for (uint i; i < N; ++i) {
-            uint amountOut = (balances[i] * shares) / _totalSupply;
-            require(amountOut >= minAmountsOut[i], "out < min");
-
-            balances[i] -= amountOut;
-            amountsOut[i] = amountOut;
-
-            IERC20(tokens[i]).transfer(msg.sender, amountOut);
-        }
-
-        _burn(msg.sender, shares);
     }
 }
 
